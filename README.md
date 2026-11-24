@@ -171,16 +171,35 @@ curl -sS -o /dev/null \
 
 ### Database ###
 
-The database runs in a container and contains data already. To specify a different container image, set `DB_IMAGE`.
+The database runs in the `roadmap-data` container. `make start-db` starts an
+existing container without recreating it and leaves a running database intact.
+New containers store PostgreSQL data in the persistent `roadmap-postgres-data`
+volume, configurable with `ROADMAP_DB_VOLUME`. `ROADMAP_DB_PORT` controls the
+published port and defaults to 5432.
+Stopping or removing the container does not remove this named volume.
+
+To specify the image used when creating a new container, set `ROADMAP_DB_IMAGE`:
 
 ```shell
-export DB_IMAGE=digital-roadmap:latest
-make start-db
+ROADMAP_DB_IMAGE=quay.io/samdoran/roadmap-data:latest make start-db
 ```
 
-To restart the database container, run `make start-db`.
+Use `make stop-db` to stop the database and `make start-db` to resume it with its
+existing data. `make load-host-data` still replaces the inventory; omit that
+target when resuming a database whose data you want to keep. Existing containers
+keep their original storage configuration; the persistent-volume setup applies
+to newly created containers.
 
-To stop the database, run `make stop-db`.
+To recreate the v2 database objects without replacing inventory data, run:
+
+```shell
+make install-v2-inventory-index
+```
+
+This is an idempotent owner-level setup step. It installs the compatibility and
+v2 token functions, the catalog-specific normalized-token GIN, OS-major
+statistics and planner `ANALYZE` runs. The API process never performs this DDL
+at startup or during a request.
 
 ### Testing
 

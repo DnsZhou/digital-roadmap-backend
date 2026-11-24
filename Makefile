@@ -14,6 +14,7 @@ export PIP_DISABLE_PIP_VERSION_CHECK = 1
 
 ROADMAP_DB_IMAGE ?= quay.io/samdoran/roadmap-data
 ROADMAP_DB_PORT ?= 5432
+ROADMAP_DB_VOLUME ?= roadmap-postgres-data
 
 # Set the shell because otherwise this defaults to /bin/sh,
 # which is dash on Ubuntu. The type builtin for dash does not accept flags.
@@ -54,8 +55,14 @@ endif
 
 
 .PHONY: start-db
-start-db: stop-db
-	$(CONTAINER_RUNTIME) run --rm -d -p $(ROADMAP_DB_PORT):5432 --name roadmap-data $(ROADMAP_DB_IMAGE)
+start-db: check-container-runtime
+	@if $(CONTAINER_RUNTIME) container inspect roadmap-data > /dev/null 2>&1; then \
+		$(CONTAINER_RUNTIME) start roadmap-data; \
+	else \
+		$(CONTAINER_RUNTIME) run -d -p $(ROADMAP_DB_PORT):5432 \
+			--name roadmap-data --restart unless-stopped \
+			-v $(ROADMAP_DB_VOLUME):/var/lib/postgresql/data $(ROADMAP_DB_IMAGE); \
+	fi
 
 .PHONY: stop-db
 stop-db: check-container-runtime
@@ -65,6 +72,11 @@ stop-db: check-container-runtime
 .PHONY: load-host-data
 load-host-data:
 	@PYTHONPATH=./src/ $(VENV_PYTHON) $(PROJECT_DIR)/scripts/load_host_data.py
+	@$(MAKE) install-v2-inventory-index
+
+.PHONY: install-v2-inventory-index
+install-v2-inventory-index:
+	@PYTHONPATH=./src/ $(VENV_PYTHON) $(PROJECT_DIR)/scripts/install_v2_inventory.py
 
 .PHONY: run
 run:

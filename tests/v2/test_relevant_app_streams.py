@@ -1,3 +1,5 @@
+import json
+
 from uuid import UUID
 
 import pytest
@@ -10,7 +12,15 @@ from roadmap.data.app_streams import AppStreamEntity
 from roadmap.data.app_streams import AppStreamImplementation
 from roadmap.models import SystemInfo
 from roadmap.v1.lifecycle.app_streams import AppStreamKey
-from roadmap.v1.lifecycle.app_streams import systems_by_app_stream
+from roadmap.v2 import relevant_app_streams as v2_streams
+from roadmap.v2.app_stream_rules import stream_id
+from roadmap.v2.inventory import get_inventory
+from roadmap.v2.inventory import Inventory
+
+
+@pytest.fixture(autouse=True)
+def catalog_patches(client, monkeypatch):
+    client.catalog_patches = monkeypatch
 
 
 def _apply_auth_overrides(client):
@@ -103,10 +113,55 @@ class TestV2AppStreamsSystems:
 
     @staticmethod
     def _override_systems(client, systems_by_stream):
-        async def controlled_systems_by_app_stream():
-            return systems_by_stream
+        # Seed only the matching boundary. PostgreSQL still executes the real
+        # minor precedence, union, search, ordering, count and pagination SQL.
+        entries = {stream_id(key.app_stream_entity): key for key in systems_by_stream}
+        hosts = {
+            str(host.id): host.model_dump(mode="json") for systems in systems_by_stream.values() for host in systems
+        }
+        matches = [
+            {"stream_id": stream_id(key.app_stream_entity), "host_id": str(host.id)}
+            for key, systems in systems_by_stream.items()
+            for host in systems
+        ]
 
-        client.app.dependency_overrides[systems_by_app_stream] = controlled_systems_by_app_stream
+        class ControlledInventory(Inventory):
+            def scope(self, *args, **kwargs):
+                return """WITH hosts AS (SELECT *, '1234'::text AS org_id FROM jsonb_to_recordset(CAST(:test_hosts AS jsonb))
+                    h(id uuid, display_name text, os_major int, os_minor int))"""
+
+            async def execute(self, query, params):
+                query = query.replace("JOIN hbi.hosts h", "JOIN hosts h")
+                return await super().execute(
+                    query,
+                    {**params, "test_hosts": json.dumps(list(hosts.values())), "test_matches": json.dumps(matches)},
+                )
+
+        async def controlled_inventory():
+            from roadmap.database import get_db
+
+            async for session in get_db():
+                yield ControlledInventory(session, "1234", set())
+
+        client.app.dependency_overrides[get_inventory] = controlled_inventory
+        client.catalog_patches.setattr(
+            v2_streams,
+            "catalog",
+            lambda major=None: {
+                key: value
+                for key, value in entries.items()
+                if major is None or value.app_stream_entity.os_major == major
+            },
+        )
+        client.catalog_patches.setattr(
+            v2_streams,
+            "MATCHES",
+            """,
+            catalog AS (SELECT * FROM jsonb_to_recordset(CAST(:catalog AS jsonb)) c(stream_id text, os_minor int)),
+            matches AS (SELECT m.* FROM jsonb_to_recordset(CAST(:test_matches AS jsonb)) m(stream_id text, host_id uuid)
+                        JOIN catalog c USING(stream_id))
+        """,
+        )
 
     def test_v2_app_streams_systems_basic(self, client, v2_prefix):
         _apply_auth_overrides(client)
@@ -412,15 +467,13 @@ class TestV2AppStreamsSystems:
         operation = response.json()["paths"]["/relevant/lifecycle/app-streams/systems"]["get"]
         assert "union" in operation["description"]
         assert "parent" in operation["description"]
-        assert "cannot be isolated" in operation["description"]
-        assert "does not necessarily identify a single parent row" in operation["description"]
+        assert "stream_id" in operation["description"]
+        assert "null-minor" in operation["description"]
         minor_parameter = next(parameter for parameter in operation["parameters"] if parameter["name"] == "os_minor")
         assert "union" in minor_parameter["description"]
-        assert "concrete OS minor" in minor_parameter["description"]
-        assert "multiple app streams" in minor_parameter["description"]
         assert "may combine parent rows" in minor_parameter["description"]
-        assert "null-minor parent row" in minor_parameter["description"]
-        assert "cannot be isolated" in minor_parameter["description"]
+        identity = next(parameter for parameter in operation["parameters"] if parameter["name"] == "stream_id")
+        assert "Null minor remains distinct from zero" in identity["description"]
 
     def test_v2_app_streams_systems_not_found(self, client, v2_prefix):
         _apply_auth_overrides(client)
@@ -472,3 +525,56 @@ class TestV2AppStreamsSystems:
             params={"name": "test", "os_major": 9, "os_minor": 0, "offset": -1},
         )
         assert response.status_code == 422
+
+    def test_exact_parent_identity_isolates_null_minor(self, client, v2_prefix):
+        _apply_auth_overrides(client)
+        wildcard = AppStreamEntity(
+            name="controlled",
+            application_stream_name="Controlled 1",
+            display_name="Controlled",
+            stream="1",
+            impl=AppStreamImplementation.package,
+            os_major=9,
+            os_minor=None,
+        )
+        exact = wildcard.model_copy(update={"os_minor": 0})
+        a = SystemInfo(id=UUID(int=100), display_name="Host %_", os_major=9, os_minor=2)
+        b = SystemInfo(id=UUID(int=101), display_name="Host ordinary", os_major=9, os_minor=0)
+        self._override_systems(
+            client,
+            {
+                AppStreamKey(name="controlled", app_stream_entity=wildcard): {a},
+                AppStreamKey(name="controlled", app_stream_entity=exact): {b},
+            },
+        )
+        response = client.get(
+            f"{v2_prefix}/relevant/lifecycle/app-streams/systems",
+            params={"name": "controlled", "os_major": 9, "stream_id": stream_id(wildcard)},
+        )
+        assert response.status_code == 200
+        assert response.json()["meta"] == {"count": 1, "total": 1}
+        assert response.json()["data"][0]["id"] == str(a.id)
+
+    def test_search_literals_sort_and_out_of_range_page(self, client, v2_prefix):
+        _apply_auth_overrides(client)
+        entity = AppStreamEntity(
+            name="controlled",
+            application_stream_name="Controlled 1",
+            display_name="Controlled",
+            stream="1",
+            impl=AppStreamImplementation.package,
+            os_major=9,
+            os_minor=None,
+        )
+        hosts = {
+            SystemInfo(id=UUID(int=i), display_name=name, os_major=9, os_minor=0)
+            for i, name in [(100, "same %_"), (101, "same %_"), (102, "same ordinary")]
+        }
+        self._override_systems(client, {AppStreamKey(name="controlled", app_stream_entity=entity): hosts})
+        params = {"name": "controlled", "os_major": 9, "search": "%_", "sort_order": "desc", "limit": 1}
+        response = client.get(f"{v2_prefix}/relevant/lifecycle/app-streams/systems", params=params)
+        assert response.status_code == 200
+        assert response.json()["meta"] == {"count": 1, "total": 2}
+        assert response.json()["data"][0]["id"] == str(UUID(int=101))
+        response = client.get(f"{v2_prefix}/relevant/lifecycle/app-streams/systems", params={**params, "offset": 20})
+        assert response.json() == {"meta": {"count": 0, "total": 2}, "data": []}

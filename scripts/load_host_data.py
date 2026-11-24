@@ -14,6 +14,7 @@ from faker import Faker
 from sqlalchemy import create_engine
 from sqlalchemy import delete
 from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped
@@ -59,7 +60,7 @@ class SystemProfileStatic(HBI):
     org_id: Mapped[str] = mapped_column(String(36))
     operating_system: Mapped[JSONB] = mapped_column(JSONB(), nullable=True, default={})
     os_release: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    dnf_modules: Mapped[JSONB] = mapped_column(JSONB(), nullable=True, default=[])
+    dnf_modules: Mapped[list[dict] | None] = mapped_column(ARRAY(JSONB()), nullable=True, default=list)
 
 
 class SystemProfileDynamic(HBI):
@@ -67,7 +68,7 @@ class SystemProfileDynamic(HBI):
 
     host_id: Mapped[UUID] = mapped_column(UUID(), ForeignKey("hbi.hosts.id"), primary_key=True)
     org_id: Mapped[str] = mapped_column(String(36))
-    installed_packages: Mapped[JSONB] = mapped_column(JSONB(), nullable=True, default=[])
+    installed_packages: Mapped[list[str] | None] = mapped_column(ARRAY(String()), nullable=True, default=list)
     installed_products: Mapped[JSONB] = mapped_column(JSONB(), nullable=True, default=[])
 
 
@@ -157,7 +158,7 @@ def main():
                 org_id="1234",
                 operating_system=system_profile.get("operating_system", {}),
                 os_release=system_profile.get("os_release"),
-                dnf_modules=system_profile.get("dnf_modules", []),
+                dnf_modules=system_profile.get("dnf_modules") or [],
             )
         )
 
@@ -166,7 +167,7 @@ def main():
             SystemProfileDynamic(
                 host_id=id,
                 org_id="1234",
-                installed_packages=system_profile.get("installed_packages", []),
+                installed_packages=system_profile.get("installed_packages") or [],
                 installed_products=system_profile.get("installed_products", []),
             )
         )

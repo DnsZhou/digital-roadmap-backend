@@ -1,137 +1,143 @@
 import typing as t
 
 from fastapi import APIRouter
-from fastapi import Depends
 from fastapi import Query
 
+from roadmap.common import MajorVersion
+from roadmap.common import MinorVersion
+from roadmap.common import sort_attrs
 from roadmap.models import Meta
 from roadmap.models import PaginatedSystemsResponse
-from roadmap.models import SystemInfo
 from roadmap.v1.lifecycle.app_streams import AppStreamKey
-from roadmap.v1.lifecycle.app_streams import get_relevant_app_streams
+from roadmap.v1.lifecycle.app_streams import related_app_streams
+from roadmap.v1.lifecycle.app_streams import RelevantAppStream
 from roadmap.v1.lifecycle.app_streams import RelevantAppStreamsResponse
-from roadmap.v1.lifecycle.app_streams import systems_by_app_stream
+from roadmap.v2.app_stream_rules import catalog
+from roadmap.v2.app_stream_rules import compile_rules
+from roadmap.v2.inventory import empty_page
+from roadmap.v2.inventory import InventoryDep
+from roadmap.v2.inventory import read_sql
+from roadmap.v2.inventory import SortOrder
 
 
-relevant = APIRouter(
-    prefix="/relevant/lifecycle/app-streams",
-    tags=["Relevant", "App Streams", "v2"],
-)
+MATCHES = read_sql("app_stream_matches.sql")
+relevant = APIRouter(prefix="/relevant/lifecycle/app-streams", tags=["Relevant", "App Streams", "v2"])
 
 
-@relevant.get(
-    "",
-    summary="App streams based on hosts in inventory (v2 — counts only)",
-    response_model=RelevantAppStreamsResponse,
-)
-async def get_relevant_app_streams_v2(
-    systems_by_stream: t.Annotated[dict[AppStreamKey, set[SystemInfo]], Depends(systems_by_app_stream)],
-    related: bool = False,
-) -> RelevantAppStreamsResponse:
-    """Return app stream lifecycle data with counts only (v2 thin wrapper).
-
-    Delegates to the v1 endpoint and strips host-detail arrays from the
-    response to reduce payload size.
-    """
-    response = await get_relevant_app_streams(systems_by_stream, related)
-    return t.cast(
-        RelevantAppStreamsResponse,
-        {
-            "meta": response["meta"],
-            "data": [item.model_copy(update={"systems": set(), "systems_detail": set()}) for item in response["data"]],
-        },
+def match_sql(major: int | None = None) -> str:
+    # A filtered list compiles rules for exactly the same major as its hosts.
+    # Permit the planner to intersect GIN hits with that small host set early.
+    # Unfiltered/detail reads materialize package-version probes to avoid
+    # per-host token parsing. Module verification always retains this boundary.
+    if major is None:
+        return MATCHES
+    return MATCHES.replace("MATERIALIZED /* package probe */", "NOT MATERIALIZED").replace(
+        "/* same-major */ AND h.os_major=p.os_major", ""
     )
 
 
-@relevant.get(
-    "/systems",
-    summary="Paginated host details for a specific app stream (v2)",
-    response_model=PaginatedSystemsResponse,
-)
+def build_response(
+    entries: dict[str, AppStreamKey], rows: t.Sequence[t.Mapping[t.Any, t.Any]], related: bool
+) -> RelevantAppStreamsResponse:
+    installed = {entries[row["stream_id"]]: row["host_count"] for row in rows if row["host_count"] > 0}
+    counts = [(key, count, False) for key, count in installed.items()]
+    if related:
+        counts.extend((key, 0, True) for key in related_app_streams(installed))
+    data = []
+    for key, count, is_related in counts:
+        entity = key.app_stream_entity
+        if entity.rolling:
+            continue
+        data.append(
+            RelevantAppStream(
+                name=key.name,
+                display_name=entity.display_name,
+                application_stream_name=entity.application_stream_name,
+                application_stream_type=entity.application_stream_type,
+                start_date=entity.start_date,
+                end_date=entity.end_date,
+                os_major=entity.os_major,
+                os_minor=entity.os_minor,
+                count=count,
+                rolling=entity.rolling,
+                systems_detail=set(),
+                related=is_related,
+            )
+        )
+    return RelevantAppStreamsResponse(
+        meta=Meta(count=len(data), total=sum(item.count for item in data)),
+        data=sorted(data, key=sort_attrs("name", "os_major", "os_minor")),
+    )
+
+
+@relevant.get("", summary="App streams with database-aggregated host counts", response_model=RelevantAppStreamsResponse)
+async def get_relevant_app_streams_v2(
+    inventory: InventoryDep,
+    related: bool = False,
+    major: MajorVersion | None = None,
+    minor: MinorVersion | None = None,
+) -> RelevantAppStreamsResponse:
+    entries = catalog(major)
+    params = {**compile_rules(entries), "major": str(major), "minor": str(minor)}
+    rows = await inventory.execute(
+        inventory.scope(major, minor, modules=True)
+        + match_sql(major)
+        + """
+        SELECT stream_id, count(*) AS host_count FROM matches GROUP BY stream_id
+    """,
+        params,
+    )
+    return build_response(entries, rows, related)
+
+
+@relevant.get("/systems", summary="Paginated host details for an app stream", response_model=PaginatedSystemsResponse)
 async def get_app_streams_systems_v2(
-    systems_by_stream: t.Annotated[dict[AppStreamKey, set[SystemInfo]], Depends(systems_by_app_stream)],
+    inventory: InventoryDep,
     name: t.Annotated[str, Query(description="App stream list name or short internal name")],
     os_major: t.Annotated[int, Query(description="RHEL major version")],
     os_minor: t.Annotated[
         int | None,
         Query(
-            description=(
-                "Optional RHEL minor; omit to union across minors for the matched name and major. "
-                "Pass it to narrow results to a concrete OS minor, but multiple app streams can "
-                "still share the same name, major, and minor, so the result may combine parent "
-                "rows. A null-minor parent row cannot be isolated with the current query "
-                "parameters when other minor rows share the name and major."
-            )
+            description="Omit to union across minors. An exact minor with installed hosts takes precedence over a null-minor wildcard; this may combine parent rows."
+        ),
+    ] = None,
+    stream_id: t.Annotated[
+        str | None,
+        Query(
+            description="Exact parent identity: JSON array [display_name, application_stream_name, os_major, os_minor]. Null minor remains distinct from zero and omission. Overrides legacy name/minor matching."
         ),
     ] = None,
     offset: t.Annotated[int, Query(ge=0)] = 0,
     limit: t.Annotated[int, Query(ge=1, le=100)] = 10,
     search: str | None = None,
+    sort_order: SortOrder = "asc",
 ) -> PaginatedSystemsResponse:
-    """Return paginated host details for a specific app stream.
+    """Legacy name matching can union multiple parent rows across minors.
 
-    The name may be either the list name or the app stream entity's short name.
-    When ``os_minor`` is omitted, the result is the union of all matching
-    name-and-major keys, so ``meta.total`` may exceed a single parent list
-    row's ``count``. Supplying ``os_minor`` narrows results to a concrete OS
-    minor, but does not necessarily identify a single parent row: multiple app
-    streams can share the same name, major, and minor, so ``meta.total`` may
-    still combine their systems. A null-minor parent row cannot be isolated
-    with the current query parameters when other minor rows share the name and
-    major; omitting ``os_minor`` returns the union.
-
-    When ``os_minor`` is supplied, an exact minor match takes precedence over
-    an entity with no minor, which acts as a wildcard. Results are then sorted,
-    filtered by optional display-name search, and paginated in Python.
+    Supply stream_id to isolate the clicked parent, including a null-minor row.
+    Without it, an installed exact minor takes precedence over a wildcard.
     """
-    query_name = name.casefold()
-    exact_systems: set[SystemInfo] | None = None
-    wildcard_systems: set[SystemInfo] = set()
-    union_systems: set[SystemInfo] = set()
-
-    # Late #431 / CodeRabbit requested deterministic matching: only an entity
-    # with os_minor=None could wildcard, and omitting os_minor with no such
-    # entity returned empty. That re-broke RHEL 9 package streams with
-    # os_minor=0, docs/support calls that omit the minor, and short names that
-    # differ from list names such as "Redis 6". RHINENG-32627 intentionally
-    # reverses that omit->empty rule: omission means union by name+major, and
-    # matching accepts the entity's short name. Do not re-adopt the
-    # deterministic omit path without revisiting this ticket.
-    for key, systems in systems_by_stream.items():
-        if key.name.casefold() != query_name and key.app_stream_entity.name.casefold() != query_name:
-            continue
-        if key.app_stream_entity.os_major != os_major:
-            continue
-
-        entity_minor = key.app_stream_entity.os_minor
-        if os_minor is None:
-            union_systems.update(systems)
-            continue
-        if entity_minor == os_minor:
-            if exact_systems is None:
-                exact_systems = set()
-            exact_systems.update(systems)
-            continue
-        if entity_minor is None:
-            wildcard_systems.update(systems)
-
-    if os_minor is None:
-        matching_systems = union_systems
-    elif exact_systems is not None:
-        matching_systems = exact_systems
-    else:
-        matching_systems = wildcard_systems
-
-    filtered = sorted(matching_systems, key=lambda s: (s.display_name, str(s.id)))
-
-    if search:
-        search_lower = search.lower()
-        filtered = [s for s in filtered if search_lower in s.display_name.lower()]
-
-    total = len(filtered)
-    page = filtered[offset : offset + limit]
-
-    return PaginatedSystemsResponse(
-        meta=Meta(count=len(page), total=total),
-        data=page,
+    entries = {
+        key: value
+        for key, value in catalog(os_major).items()
+        if (
+            key == stream_id
+            if stream_id is not None
+            else name.casefold() in (value.name.casefold(), value.app_stream_entity.name.casefold())
+            and (os_minor is None or value.app_stream_entity.os_minor in (None, os_minor))
+        )
+    }
+    if not entries:
+        return empty_page()
+    # Precedence is based on installed matches, before display-name search and
+    # pagination. A catalog entry with zero hosts must not suppress a wildcard.
+    selection = "SELECT host_id FROM matches"
+    if stream_id is None and os_minor is not None:
+        selection = """SELECT m.host_id FROM matches m JOIN catalog c USING(stream_id)
+            WHERE c.os_minor=:requested_minor OR (c.os_minor IS NULL AND NOT EXISTS (
+                SELECT 1 FROM matches exact JOIN catalog ec USING(stream_id) WHERE ec.os_minor=:requested_minor
+            ))"""
+    cte = inventory.scope(modules=True) + match_sql() + ", selected AS (" + selection + ")"
+    return await inventory.page(
+        cte, {**compile_rules(entries), "requested_minor": os_minor}, offset, limit, search, sort_order
     )

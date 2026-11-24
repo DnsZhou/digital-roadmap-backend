@@ -81,12 +81,12 @@ def build_records(host: dict, randomizer: random.Random) -> tuple[dict, dict, di
         "org_id": "1234",
         "operating_system": system_profile.get("operating_system", {}),
         "os_release": system_profile.get("os_release"),
-        "dnf_modules": system_profile.get("dnf_modules", []),
+        "dnf_modules": system_profile.get("dnf_modules") or [],
     }
     dynamic_profile_record = {
         "host_id": host_id,
         "org_id": "1234",
-        "installed_packages": system_profile.get("installed_packages", []),
+        "installed_packages": system_profile.get("installed_packages") or [],
         "installed_products": system_profile.get("installed_products", []),
     }
     return host_record, static_profile_record, dynamic_profile_record
